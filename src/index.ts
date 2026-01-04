@@ -733,6 +733,487 @@ function createMcpServer(): McpServer {
     return { content: [{ type: "text", text: JSON.stringify(result.rows, null, 2) }] };
   });
 
+  // ============ ADDITIONAL ANALYSIS TOOLS ============
+
+  server.tool("get_database_sizes", "Get sizes of all databases", {}, async () => {
+    const result = await executeQuery(`
+      SELECT 
+        datname as database_name,
+        pg_size_pretty(pg_database_size(datname)) as size,
+        pg_database_size(datname) as size_bytes
+      FROM pg_database
+      WHERE datistemplate = false
+      ORDER BY pg_database_size(datname) DESC
+    `);
+    return { content: [{ type: "text", text: JSON.stringify(result.rows, null, 2) }] };
+  });
+
+  server.tool("get_table_sizes", "Get sizes of all tables in a schema", {
+    schema: z.string().optional().describe("Schema name (default: public)")
+  }, async ({ schema = "public" }) => {
+    const result = await executeQuery(`
+      SELECT 
+        relname as table_name,
+        pg_size_pretty(pg_total_relation_size(relid)) as total_size,
+        pg_size_pretty(pg_relation_size(relid)) as data_size,
+        pg_size_pretty(pg_indexes_size(relid)) as index_size,
+        pg_total_relation_size(relid) as total_bytes
+      FROM pg_catalog.pg_statio_user_tables
+      WHERE schemaname = $1
+      ORDER BY pg_total_relation_size(relid) DESC
+    `, [schema]);
+    return { content: [{ type: "text", text: JSON.stringify(result.rows, null, 2) }] };
+  });
+
+  server.tool("list_foreign_keys", "List all foreign key relationships", {
+    table: z.string().optional().describe("Filter by table name"),
+    schema: z.string().optional()
+  }, async ({ table, schema = "public" }) => {
+    let query = `
+      SELECT 
+        tc.table_name as from_table,
+        kcu.column_name as from_column,
+        ccu.table_name as to_table,
+        ccu.column_name as to_column,
+        tc.constraint_name,
+        rc.update_rule,
+        rc.delete_rule
+      FROM information_schema.table_constraints tc
+      JOIN information_schema.key_column_usage kcu 
+        ON tc.constraint_name = kcu.constraint_name
+        AND tc.table_schema = kcu.table_schema
+      JOIN information_schema.constraint_column_usage ccu 
+        ON ccu.constraint_name = tc.constraint_name
+        AND ccu.table_schema = tc.table_schema
+      JOIN information_schema.referential_constraints rc
+        ON rc.constraint_name = tc.constraint_name
+        AND rc.constraint_schema = tc.table_schema
+      WHERE tc.constraint_type = 'FOREIGN KEY'
+        AND tc.table_schema = $1
+    `;
+    const params: any[] = [schema];
+    
+    if (table) {
+      query += ` AND (tc.table_name = $2 OR ccu.table_name = $2)`;
+      params.push(table);
+    }
+    
+    query += ` ORDER BY tc.table_name, kcu.column_name`;
+    
+    const result = await executeQuery(query, params);
+    return { content: [{ type: "text", text: JSON.stringify(result.rows, null, 2) }] };
+  });
+
+  server.tool("list_triggers", "List all triggers in a schema", {
+    table: z.string().optional().describe("Filter by table name"),
+    schema: z.string().optional()
+  }, async ({ table, schema = "public" }) => {
+    let query = `
+      SELECT 
+        trigger_name,
+        event_manipulation as event,
+        event_object_table as table_name,
+        action_timing as timing,
+        action_statement as action
+      FROM information_schema.triggers
+      WHERE trigger_schema = $1
+    `;
+    const params: any[] = [schema];
+    
+    if (table) {
+      query += ` AND event_object_table = $2`;
+      params.push(table);
+    }
+    
+    query += ` ORDER BY event_object_table, trigger_name`;
+    
+    const result = await executeQuery(query, params);
+    return { content: [{ type: "text", text: JSON.stringify(result.rows, null, 2) }] };
+  });
+
+  server.tool("get_locks", "Get current database locks", {
+    blockedOnly: z.boolean().optional().describe("Show only blocked queries")
+  }, async ({ blockedOnly = false }) => {
+    let query = `
+      SELECT 
+        pg_stat_activity.pid,
+        pg_stat_activity.usename,
+        pg_stat_activity.query,
+        pg_stat_activity.state,
+        pg_locks.mode as lock_mode,
+        pg_locks.locktype,
+        pg_locks.granted,
+        pg_class.relname as locked_relation
+      FROM pg_stat_activity
+      JOIN pg_locks ON pg_stat_activity.pid = pg_locks.pid
+      LEFT JOIN pg_class ON pg_locks.relation = pg_class.oid
+      WHERE pg_stat_activity.datname = current_database()
+    `;
+    
+    if (blockedOnly) {
+      query += ` AND pg_locks.granted = false`;
+    }
+    
+    query += ` ORDER BY pg_stat_activity.query_start`;
+    
+    const result = await executeQuery(query);
+    return { content: [{ type: "text", text: JSON.stringify(result.rows, null, 2) }] };
+  });
+
+  server.tool("kill_connection", "Terminate a database connection", {
+    pid: z.number().describe("Process ID to terminate"),
+    force: z.boolean().optional().describe("Force immediate termination (pg_terminate_backend)")
+  }, async ({ pid, force = false }) => {
+    try {
+      const func = force ? "pg_terminate_backend" : "pg_cancel_backend";
+      const result = await executeQuery(`SELECT ${func}($1) as success`, [pid]);
+      return { content: [{ type: "text", text: JSON.stringify({ 
+        success: result.rows[0].success, 
+        message: result.rows[0].success ? `Connection ${pid} terminated` : `Failed to terminate ${pid}`,
+        method: func
+      }, null, 2) }] };
+    } catch (error: any) {
+      return { content: [{ type: "text", text: JSON.stringify({ error: error.message }, null, 2) }] };
+    }
+  });
+
+  server.tool("get_bloat", "Get table and index bloat estimates", {
+    schema: z.string().optional()
+  }, async ({ schema = "public" }) => {
+    const result = await executeQuery(`
+      SELECT
+        schemaname,
+        tablename,
+        pg_size_pretty(pg_total_relation_size(schemaname || '.' || tablename)) as total_size,
+        n_dead_tup as dead_tuples,
+        n_live_tup as live_tuples,
+        CASE WHEN n_live_tup > 0 
+          THEN round(100.0 * n_dead_tup / (n_live_tup + n_dead_tup), 2)
+          ELSE 0 
+        END as dead_tuple_percent
+      FROM pg_stat_user_tables
+      WHERE schemaname = $1
+      ORDER BY n_dead_tup DESC
+    `, [schema]);
+    return { content: [{ type: "text", text: JSON.stringify(result.rows, null, 2) }] };
+  });
+
+  server.tool("get_index_usage", "Get index usage statistics", {
+    schema: z.string().optional()
+  }, async ({ schema = "public" }) => {
+    const result = await executeQuery(`
+      SELECT
+        schemaname,
+        relname as table_name,
+        indexrelname as index_name,
+        idx_scan as times_used,
+        idx_tup_read as tuples_read,
+        idx_tup_fetch as tuples_fetched,
+        pg_size_pretty(pg_relation_size(indexrelid)) as index_size
+      FROM pg_stat_user_indexes
+      WHERE schemaname = $1
+      ORDER BY idx_scan DESC
+    `, [schema]);
+    return { content: [{ type: "text", text: JSON.stringify(result.rows, null, 2) }] };
+  });
+
+  server.tool("get_unused_indexes", "Find indexes that are never or rarely used", {
+    schema: z.string().optional(),
+    minSize: z.string().optional().describe("Minimum index size (e.g., '1 MB')")
+  }, async ({ schema = "public", minSize = "0" }) => {
+    const result = await executeQuery(`
+      SELECT
+        schemaname,
+        relname as table_name,
+        indexrelname as index_name,
+        idx_scan as times_used,
+        pg_size_pretty(pg_relation_size(indexrelid)) as index_size,
+        pg_relation_size(indexrelid) as size_bytes
+      FROM pg_stat_user_indexes
+      WHERE schemaname = $1
+        AND idx_scan < 50
+        AND indexrelname NOT LIKE '%pkey%'
+      ORDER BY pg_relation_size(indexrelid) DESC
+    `, [schema]);
+    return { content: [{ type: "text", text: JSON.stringify(result.rows, null, 2) }] };
+  });
+
+  server.tool("get_cache_hit_ratio", "Get buffer cache hit ratio", {}, async () => {
+    const result = await executeQuery(`
+      SELECT 
+        'index' as type,
+        sum(idx_blks_hit) as hits,
+        sum(idx_blks_read) as reads,
+        CASE WHEN sum(idx_blks_hit + idx_blks_read) > 0
+          THEN round(100.0 * sum(idx_blks_hit) / sum(idx_blks_hit + idx_blks_read), 2)
+          ELSE 0
+        END as hit_ratio
+      FROM pg_statio_user_indexes
+      UNION ALL
+      SELECT 
+        'table' as type,
+        sum(heap_blks_hit) as hits,
+        sum(heap_blks_read) as reads,
+        CASE WHEN sum(heap_blks_hit + heap_blks_read) > 0
+          THEN round(100.0 * sum(heap_blks_hit) / sum(heap_blks_hit + heap_blks_read), 2)
+          ELSE 0
+        END as hit_ratio
+      FROM pg_statio_user_tables
+    `);
+    return { content: [{ type: "text", text: JSON.stringify(result.rows, null, 2) }] };
+  });
+
+  server.tool("get_table_row_counts", "Get row counts for all tables", {
+    schema: z.string().optional()
+  }, async ({ schema = "public" }) => {
+    const result = await executeQuery(`
+      SELECT 
+        relname as table_name,
+        n_live_tup as estimated_rows
+      FROM pg_stat_user_tables
+      WHERE schemaname = $1
+      ORDER BY n_live_tup DESC
+    `, [schema]);
+    return { content: [{ type: "text", text: JSON.stringify(result.rows, null, 2) }] };
+  });
+
+  server.tool("analyze_table", "Update table statistics for query planner", {
+    table: z.string().describe("Table name"),
+    schema: z.string().optional()
+  }, async ({ table, schema = "public" }) => {
+    try {
+      await executeQuery(`ANALYZE "${schema}"."${table}"`);
+      return { content: [{ type: "text", text: JSON.stringify({ success: true, message: `ANALYZE completed on ${schema}.${table}` }, null, 2) }] };
+    } catch (error: any) {
+      return { content: [{ type: "text", text: JSON.stringify({ error: error.message }, null, 2) }] };
+    }
+  });
+
+  server.tool("get_column_stats", "Get column statistics for a table", {
+    table: z.string().describe("Table name"),
+    schema: z.string().optional()
+  }, async ({ table, schema = "public" }) => {
+    const result = await executeQuery(`
+      SELECT 
+        attname as column_name,
+        n_distinct,
+        most_common_vals,
+        most_common_freqs,
+        correlation
+      FROM pg_stats
+      WHERE schemaname = $1 AND tablename = $2
+      ORDER BY attname
+    `, [schema, table]);
+    return { content: [{ type: "text", text: JSON.stringify(result.rows, null, 2) }] };
+  });
+
+  server.tool("search_columns", "Search for columns by name across all tables", {
+    pattern: z.string().describe("Column name pattern (supports SQL LIKE)"),
+    schema: z.string().optional()
+  }, async ({ pattern, schema = "public" }) => {
+    const result = await executeQuery(`
+      SELECT 
+        table_name,
+        column_name,
+        data_type,
+        is_nullable,
+        column_default
+      FROM information_schema.columns
+      WHERE table_schema = $1
+        AND column_name LIKE $2
+      ORDER BY table_name, ordinal_position
+    `, [schema, pattern]);
+    return { content: [{ type: "text", text: JSON.stringify(result.rows, null, 2) }] };
+  });
+
+  server.tool("get_constraints", "Get all constraints for a table", {
+    table: z.string().describe("Table name"),
+    schema: z.string().optional()
+  }, async ({ table, schema = "public" }) => {
+    const result = await executeQuery(`
+      SELECT 
+        conname as constraint_name,
+        contype as constraint_type,
+        pg_get_constraintdef(c.oid) as definition
+      FROM pg_constraint c
+      JOIN pg_namespace n ON n.oid = c.connamespace
+      JOIN pg_class cl ON cl.oid = c.conrelid
+      WHERE n.nspname = $1 AND cl.relname = $2
+      ORDER BY contype, conname
+    `, [schema, table]);
+    
+    // Map constraint types
+    const typeMap: Record<string, string> = {
+      'c': 'CHECK',
+      'f': 'FOREIGN KEY',
+      'p': 'PRIMARY KEY',
+      'u': 'UNIQUE',
+      't': 'TRIGGER',
+      'x': 'EXCLUSION'
+    };
+    
+    const rows = result.rows.map(row => ({
+      ...row,
+      constraint_type: typeMap[row.constraint_type] || row.constraint_type
+    }));
+    
+    return { content: [{ type: "text", text: JSON.stringify(rows, null, 2) }] };
+  });
+
+  server.tool("get_dependent_objects", "Get objects dependent on a table", {
+    table: z.string().describe("Table name"),
+    schema: z.string().optional()
+  }, async ({ table, schema = "public" }) => {
+    const result = await executeQuery(`
+      SELECT DISTINCT
+        dependent_ns.nspname as dependent_schema,
+        dependent_view.relname as dependent_object,
+        dependent_view.relkind as object_type
+      FROM pg_depend 
+      JOIN pg_rewrite ON pg_depend.objid = pg_rewrite.oid 
+      JOIN pg_class as dependent_view ON pg_rewrite.ev_class = dependent_view.oid 
+      JOIN pg_class as source_table ON pg_depend.refobjid = source_table.oid 
+      JOIN pg_namespace dependent_ns ON dependent_view.relnamespace = dependent_ns.oid
+      JOIN pg_namespace source_ns ON source_table.relnamespace = source_ns.oid
+      WHERE source_ns.nspname = $1
+        AND source_table.relname = $2
+        AND source_table.oid != dependent_view.oid
+      ORDER BY dependent_ns.nspname, dependent_view.relname
+    `, [schema, table]);
+    
+    const typeMap: Record<string, string> = {
+      'r': 'TABLE',
+      'v': 'VIEW',
+      'm': 'MATERIALIZED VIEW',
+      'i': 'INDEX',
+      'S': 'SEQUENCE',
+      'f': 'FOREIGN TABLE'
+    };
+    
+    const rows = result.rows.map(row => ({
+      ...row,
+      object_type: typeMap[row.object_type] || row.object_type
+    }));
+    
+    return { content: [{ type: "text", text: JSON.stringify(rows, null, 2) }] };
+  });
+
+  server.tool("create_schema", "Create a new schema", {
+    name: z.string().describe("Schema name"),
+    owner: z.string().optional().describe("Schema owner")
+  }, async ({ name, owner }) => {
+    let query = `CREATE SCHEMA "${name}"`;
+    if (owner) query += ` AUTHORIZATION "${owner}"`;
+    
+    try {
+      await executeQuery(query);
+      return { content: [{ type: "text", text: JSON.stringify({ success: true, message: `Schema ${name} created` }, null, 2) }] };
+    } catch (error: any) {
+      return { content: [{ type: "text", text: JSON.stringify({ error: error.message }, null, 2) }] };
+    }
+  });
+
+  server.tool("drop_schema", "Drop a schema", {
+    name: z.string().describe("Schema name"),
+    cascade: z.boolean().optional().describe("Drop all contained objects")
+  }, async ({ name, cascade = false }) => {
+    const query = `DROP SCHEMA "${name}"${cascade ? " CASCADE" : ""}`;
+    try {
+      await executeQuery(query);
+      return { content: [{ type: "text", text: JSON.stringify({ success: true, message: `Schema ${name} dropped` }, null, 2) }] };
+    } catch (error: any) {
+      return { content: [{ type: "text", text: JSON.stringify({ error: error.message }, null, 2) }] };
+    }
+  });
+
+  server.tool("copy_table", "Copy a table structure and optionally data", {
+    sourceTable: z.string().describe("Source table name"),
+    destTable: z.string().describe("Destination table name"),
+    schema: z.string().optional(),
+    includeData: z.boolean().optional().describe("Copy data as well"),
+    includeIndexes: z.boolean().optional().describe("Copy indexes")
+  }, async ({ sourceTable, destTable, schema = "public", includeData = false, includeIndexes = false }) => {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      
+      // Create table structure
+      if (includeData) {
+        await client.query(`CREATE TABLE "${schema}"."${destTable}" AS TABLE "${schema}"."${sourceTable}"`);
+      } else {
+        await client.query(`CREATE TABLE "${schema}"."${destTable}" (LIKE "${schema}"."${sourceTable}" INCLUDING DEFAULTS INCLUDING CONSTRAINTS)`);
+      }
+      
+      // Copy indexes if requested
+      if (includeIndexes) {
+        const indexResult = await client.query(`
+          SELECT indexdef 
+          FROM pg_indexes 
+          WHERE schemaname = $1 AND tablename = $2
+            AND indexname NOT LIKE '%_pkey'
+        `, [schema, sourceTable]);
+        
+        for (const row of indexResult.rows) {
+          const newIndexDef = row.indexdef
+            .replace(`"${sourceTable}"`, `"${destTable}"`)
+            .replace(/INDEX "([^"]+)"/, `INDEX "${destTable}_$1"`);
+          await client.query(newIndexDef);
+        }
+      }
+      
+      await client.query("COMMIT");
+      return { content: [{ type: "text", text: JSON.stringify({ 
+        success: true, 
+        message: `Table ${destTable} created from ${sourceTable}`,
+        includeData,
+        includeIndexes
+      }, null, 2) }] };
+    } catch (error: any) {
+      await client.query("ROLLBACK");
+      return { content: [{ type: "text", text: JSON.stringify({ error: error.message }, null, 2) }] };
+    } finally {
+      client.release();
+    }
+  });
+
+  server.tool("rename_table", "Rename a table", {
+    oldName: z.string().describe("Current table name"),
+    newName: z.string().describe("New table name"),
+    schema: z.string().optional()
+  }, async ({ oldName, newName, schema = "public" }) => {
+    try {
+      await executeQuery(`ALTER TABLE "${schema}"."${oldName}" RENAME TO "${newName}"`);
+      return { content: [{ type: "text", text: JSON.stringify({ success: true, message: `Table renamed from ${oldName} to ${newName}` }, null, 2) }] };
+    } catch (error: any) {
+      return { content: [{ type: "text", text: JSON.stringify({ error: error.message }, null, 2) }] };
+    }
+  });
+
+  server.tool("get_pg_settings", "Get PostgreSQL configuration settings", {
+    category: z.string().optional().describe("Filter by category (e.g., 'Memory', 'Query Tuning')")
+  }, async ({ category }) => {
+    let query = `
+      SELECT 
+        name,
+        setting,
+        unit,
+        category,
+        short_desc
+      FROM pg_settings
+    `;
+    const params: any[] = [];
+    
+    if (category) {
+      query += ` WHERE category ILIKE $1`;
+      params.push(`%${category}%`);
+    }
+    
+    query += ` ORDER BY category, name`;
+    
+    const result = await executeQuery(query, params);
+    return { content: [{ type: "text", text: JSON.stringify(result.rows, null, 2) }] };
+  });
+
   return server;
 }
 
@@ -842,28 +1323,34 @@ app.get("/", (req, res) => {
       health: "/health"
     },
     tools: [
-      // Connection & Info
+      // Connection & Info (2)
       "test_connection", "get_database_info",
-      // Schema
-      "list_schemas", "list_tables", "describe_table", "list_views", "list_functions",
-      // Queries
+      // Schema Management (7)
+      "list_schemas", "create_schema", "drop_schema", "list_tables", "describe_table", "list_views", "list_functions",
+      // Query Execution (3)
       "execute_query", "execute_write", "execute_transaction",
-      // Table Operations
-      "create_table", "drop_table", "alter_table", "truncate_table",
-      // Indexes
+      // Table Operations (6)
+      "create_table", "drop_table", "alter_table", "truncate_table", "copy_table", "rename_table",
+      // Index Management (3)
       "create_index", "drop_index", "list_indexes",
-      // CRUD
+      // CRUD Helpers (4)
       "insert_row", "update_rows", "delete_rows", "select_rows",
-      // Analysis
+      // Performance Analysis (12)
       "explain_query", "get_table_stats", "get_active_connections", "get_slow_queries",
-      // Maintenance
-      "vacuum_table", "reindex",
-      // Sequences
+      "get_database_sizes", "get_table_sizes", "get_bloat", "get_index_usage", 
+      "get_unused_indexes", "get_cache_hit_ratio", "get_table_row_counts", "get_column_stats",
+      // Maintenance (3)
+      "vacuum_table", "analyze_table", "reindex",
+      // Sequences (3)
       "list_sequences", "get_sequence_value", "set_sequence_value",
-      // Extensions
+      // Extensions (3)
       "list_extensions", "list_available_extensions", "create_extension",
-      // Users & Permissions
-      "list_roles", "get_table_permissions"
+      // Users & Permissions (2)
+      "list_roles", "get_table_permissions",
+      // Relationships & Dependencies (4)
+      "list_foreign_keys", "list_triggers", "get_constraints", "get_dependent_objects",
+      // Monitoring & Admin (4)
+      "get_locks", "kill_connection", "search_columns", "get_pg_settings"
     ],
     environment: {
       DATABASE_URL: process.env.DATABASE_URL ? "configured" : "missing",
