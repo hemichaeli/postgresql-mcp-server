@@ -1,0 +1,5 @@
+node_modules
+dist
+*.log
+.env
+src/index-v2.ts
